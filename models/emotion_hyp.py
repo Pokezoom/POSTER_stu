@@ -129,4 +129,82 @@ class pyramid_trans_expr(nn.Module):
 
         return out, y_feat
 
+# 根据您提供的代码，模型的结构可以总结如下：
+#
+# ### 主要模块和流程
+#
+# 1. **数据预处理**：使用`transforms`对数据进行预处理，包括图像转换为PIL格式、随机水平翻转、调整大小、转换为Tensor、标准化以及随机擦除。
+#
+# 2. **数据集加载**：根据参数`args.dataset`，加载不同的数据集（RAF-DB、AffectNet、AffectNet8Class），并应用预处理转换。
+#
+# 3. **模型构建**：根据提供的参数（如`modeltype`），构建`pyramid_trans_expr`模型。
+#
+# ### 模型`pyramid_trans_expr`
+#
+# 1. **面部标志点提取网络（Face Landmark Backbone）**：使用`MobileFaceNet`获取面部标志点，加载预训练权重，并将其设置为不参与梯度更新。
+#
+# 2. **图像特征提取网络（Image Feature Backbone）**：使用IR50（一种卷积网络）来提取图像特征，同样加载预训练权重。
+#
+# 3. **金字塔融合变换器（Pyramid Fusion Transformer）**：这是一个自定义的Transformer网络，名为`HyVisionTransformer`，用于融合面部标志点特征和图像特征。
+#
+# 4. **SE块（Squeeze-and-Excitation Block）**：一个SE块用于进一步精细化特征。
+#
+# 5. **分类头（Classification Head）**：最后一个线性层用于将融合后的特征映射到类别标签上。
+#
+# ### 训练流程
+#
+# 1. **初始化**：设置GPU环境，种子，初始化模型和数据加载器。
+#
+# 2. **优化器**：根据参数选择AdamW、Adam或SGD作为优化器，并使用SAM（Sharpness-Aware Minimization）优化算法。
+#
+# 3. **损失函数**：使用交叉熵损失和标签平滑交叉熵损失。
+#
+# 4. **训练循环**：在每个epoch中，对训练集进行遍历，计算损失，进行反向传播和优化器的两步更新。同时，在验证集上评估模型性能。
+#
+# 5. **保存模型**：如果验证准确率超过设定阈值，保存模型的状态。
+#
+# ### 特点
+#
+# - **双流架构**：模型采用了面部标志点和图像特征的双流架构，利用面部标志点提供的精细局部信息和IR50提供的全局图像信息。
+# - **自定义Transformer**：金字塔融合变换器是模型的核心，负责融合两种类型的特征，并通过自注意力机制捕捉复杂的特征关系。
+# - **SE块**：SE块通过重新校准通道特征来增强模型的表示能力。
+# - **优化策略**：使用SAM优化算法来改善泛化能力。
+#
+# 这个模型是一个复杂的深度学习架构，结合了卷积神经网络和Transformer网络的优点，用于解决面部表情识别的问题。
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, embed_size, num_heads):
+        super(MultiHeadSelfAttention, self).__init__()
+        self.embed_size = embed_size
+        self.num_heads = num_heads
+        self.head_dim = embed_size // num_heads
 
+        assert self.head_dim * num_heads == embed_size, "Embed size needs to be divisible by num heads"
+
+        self.values = nn.Linear(self.head_dim, self.head_dim, bias=False)
+        self.keys = nn.Linear(self.head_dim, self.head_dim, bias=False)
+        self.queries = nn.Linear(self.head_dim, self.head_dim, bias=False)
+        self.fc_out = nn.Linear(num_heads * self.head_dim, embed_size)
+
+    def forward(self, values, keys, queries, mask):
+        N = queries.shape[0]
+        value_len, key_len, query_len = values.shape[1], keys.shape[1], queries.shape[1]
+
+        # Split embedding into self.num_heads different pieces
+        values = values.reshape(N, value_len, self.num_heads, self.head_dim)
+        keys = keys.reshape(N, key_len, self.num_heads, self.head_dim)
+        queries = queries.reshape(N, query_len, self.num_heads, self.head_dim)
+
+        values = self.values(values)
+        keys = self.keys(keys)
+        queries = self.queries(queries)
+
+        # Attention calculation
+        attention = torch.einsum("nqhd,nkhd->nhqk", [queries, keys])
+        attention = torch.softmax(attention / (self.embed_size ** (1 / 2)), dim=3)
+
+        out = torch.einsum("nhql,nlhd->nqhd", [attention, values]).reshape(
+            N, query_len, self.num_heads * self.head_dim
+        )
+
+        out = self.fc_out(out)
+        return out
